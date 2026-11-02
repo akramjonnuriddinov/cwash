@@ -136,6 +136,9 @@ func (a *App) onMessage(ctx context.Context, m *models.Message) {
 
 	text := strings.TrimSpace(m.Text)
 	cmd, arg, _ := strings.Cut(text, " ")
+	if text == btnCancel { // menu buttons contain spaces, so match the full text
+		cmd = btnCancel
+	}
 	switch cmd {
 	case "/start":
 		a.clearState(m.From.ID)
@@ -148,6 +151,13 @@ func (a *App) onMessage(ctx context.Context, m *models.Message) {
 	case "/myid":
 		a.send(ctx, chatID, "Your Telegram ID: <code>"+itoa(m.From.ID)+"</code>", nil)
 		return
+	}
+
+	// Tapping a menu button mid-dialog abandons the dialog instead of being
+	// treated as input (e.g. "📋 Today" is not a plate number).
+	switch text {
+	case btnBook, btnMyOrders, btnContacts, btnToday, btnUpcoming, btnWalkin:
+		a.clearState(m.From.ID)
 	}
 
 	if s := a.getState(m.From.ID); s != nil {
