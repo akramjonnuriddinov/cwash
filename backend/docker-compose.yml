@@ -1,0 +1,20 @@
+name: cwash
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cwash
+      POSTGRES_PASSWORD: cwash
+      POSTGRES_DB: cwash
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cwash"]
+      interval: 3s
+      retries: 10
+
+volumes:
+  pgdata:
