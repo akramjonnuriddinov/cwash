@@ -15,45 +15,36 @@ import (
 	"github.com/akramjon/cwash/backend/internal/store"
 )
 
-const (
-	btnBook     = "📅 Book a wash"
-	btnMyOrders = "🚗 My orders"
-	btnContacts = "📍 Contacts"
-	btnToday    = "📋 Today"
-	btnUpcoming = "🗓 Upcoming"
-	btnWalkin   = "➕ Walk-in car"
-	btnCancel   = "✖️ Cancel"
-	btnPhone    = "📱 Share phone number"
-)
+func kbtn(l, key string) models.KeyboardButton { return models.KeyboardButton{Text: T(l, key)} }
 
-func mainMenu(admin bool) models.ReplyMarkup {
+func (a *App) mainMenu(l string, admin bool) models.ReplyMarkup {
 	rows := [][]models.KeyboardButton{}
 	if admin {
 		rows = append(rows,
-			[]models.KeyboardButton{{Text: btnToday}, {Text: btnUpcoming}},
-			[]models.KeyboardButton{{Text: btnWalkin}},
+			[]models.KeyboardButton{kbtn(l, "btn_today"), kbtn(l, "btn_upcoming")},
+			[]models.KeyboardButton{kbtn(l, "btn_walkin")},
 		)
 	}
 	rows = append(rows,
-		[]models.KeyboardButton{{Text: btnBook}, {Text: btnMyOrders}},
-		[]models.KeyboardButton{{Text: btnContacts}},
+		[]models.KeyboardButton{kbtn(l, "btn_book"), kbtn(l, "btn_orders")},
+		[]models.KeyboardButton{kbtn(l, "btn_contacts"), kbtn(l, "btn_lang")},
 	)
 	return &models.ReplyKeyboardMarkup{Keyboard: rows, ResizeKeyboard: true}
 }
 
-func phoneKeyboard() models.ReplyMarkup {
+func phoneKeyboard(l string) models.ReplyMarkup {
 	return &models.ReplyKeyboardMarkup{
 		Keyboard: [][]models.KeyboardButton{
-			{{Text: btnPhone, RequestContact: true}},
-			{{Text: btnCancel}},
+			{{Text: T(l, "btn_phone"), RequestContact: true}},
+			{kbtn(l, "btn_cancel")},
 		},
 		ResizeKeyboard:  true,
 		OneTimeKeyboard: true,
 	}
 }
 
-func cancelKeyboard() models.ReplyMarkup {
-	return &models.ReplyKeyboardMarkup{Keyboard: [][]models.KeyboardButton{{{Text: btnCancel}}}, ResizeKeyboard: true}
+func cancelKeyboard(l string) models.ReplyMarkup {
+	return &models.ReplyKeyboardMarkup{Keyboard: [][]models.KeyboardButton{{kbtn(l, "btn_cancel")}}, ResizeKeyboard: true}
 }
 
 func ib(text, data string) models.InlineKeyboardButton {
@@ -101,13 +92,15 @@ func (a *App) answer(ctx context.Context, cq *models.CallbackQuery, text string,
 	})
 }
 
-func (a *App) fail(ctx context.Context, chatID int64, err error) {
+func (a *App) fail(ctx context.Context, chatID int64, l string, err error) {
 	log.Printf("error (chat %d): %v", chatID, err)
-	a.send(ctx, chatID, "⚠️ Something went wrong, please try again.", nil)
+	a.send(ctx, chatID, T(l, "error"), nil)
 }
 
-func (a *App) notifyAdmins(ctx context.Context, text string, kb models.ReplyMarkup) {
+// notifyAdmins sends each admin a message built in their own language.
+func (a *App) notifyAdmins(ctx context.Context, build func(l string) (string, models.ReplyMarkup)) {
 	for id := range a.cfg.AdminIDs {
+		text, kb := build(a.langOf(ctx, id))
 		a.send(ctx, id, text, kb)
 	}
 }
@@ -122,18 +115,17 @@ func (a *App) local(t time.Time) time.Time { return t.In(a.cfg.Location) }
 
 func (a *App) fmtTime(t time.Time) string { return a.local(t).Format("15:04") }
 
-func (a *App) fmtDay(t time.Time) string {
+// fmtDay: "Today" / "Tomorrow" / "Mon, 03 Nov" in the given language.
+func (a *App) fmtDay(l string, t time.Time) string {
 	t = a.local(t)
-	now := a.local(time.Now())
-	y1, m1, d1 := t.Date()
-	y2, m2, d2 := now.Date()
-	switch {
-	case y1 == y2 && m1 == m2 && d1 == d2:
-		return "Today"
-	case t.Sub(time.Date(y2, m2, d2, 0, 0, 0, 0, a.cfg.Location)) < 48*time.Hour && t.After(now):
-		return "Tomorrow"
+	today := a.dayStart(time.Now())
+	switch a.dayStart(t).Sub(today) {
+	case 0:
+		return T(l, "today")
+	case 24 * time.Hour:
+		return T(l, "tomorrow")
 	}
-	return t.Format("Mon, 02 Jan")
+	return fmtDate(l, t)
 }
 
 func (a *App) fmtPrice(p int) string {
@@ -148,42 +140,41 @@ func (a *App) fmtPrice(p int) string {
 	return b.String() + " " + a.cfg.Currency
 }
 
-func (a *App) serviceLabel(s store.Service) string {
-	return s.Name + " · " + strconv.Itoa(s.DurationMin) + " min · " + a.fmtPrice(s.Price)
+func (a *App) serviceLabel(l string, s store.Service) string {
+	return T(l, "svc_label", s.Name.Get(l), s.DurationMin, a.fmtPrice(s.Price))
 }
 
-func (a *App) statusLine(o *store.Order) string {
+func (a *App) statusLine(l string, o *store.Order) string {
 	switch o.Status {
 	case store.StatusBooked:
-		return "📅 Booked for <b>" + a.fmtDay(o.ScheduledAt) + ", " + a.fmtTime(o.ScheduledAt) + "</b>"
+		return T(l, "st_booked", a.fmtDay(l, o.ScheduledAt), a.fmtTime(o.ScheduledAt))
 	case store.StatusWaiting:
-		return "🚗 At the wash, waiting in queue"
+		return T(l, "st_waiting")
 	case store.StatusWashing:
 		if o.EtaAt == nil {
-			return "🧽 Washing now"
+			return T(l, "st_washing")
 		}
-		left := time.Until(*o.EtaAt).Round(time.Minute)
-		s := "🧽 Washing — ready at about <b>" + a.fmtTime(*o.EtaAt) + "</b>"
-		if left > 0 {
-			s += " (~" + itoa(int64(left.Minutes())) + " min)"
+		s := T(l, "st_washing_eta", a.fmtTime(*o.EtaAt))
+		if left := time.Until(*o.EtaAt).Round(time.Minute); left > 0 {
+			s += T(l, "st_left", int(left.Minutes()))
 		}
 		return s
 	case store.StatusReady:
-		return "✅ <b>Ready!</b> You can pick up your car"
+		return T(l, "st_ready")
 	case store.StatusDone:
-		return "🏁 Picked up"
+		return T(l, "st_done")
 	case store.StatusCancelled:
-		return "❌ Cancelled"
+		return T(l, "st_cancelled")
 	}
 	return o.Status
 }
 
-func (a *App) orderCard(o *store.Order, forAdmin bool) string {
+func (a *App) orderCard(l string, o *store.Order, forAdmin bool) string {
 	var b strings.Builder
-	b.WriteString("🚘 <b>" + esc(o.CarPlate) + "</b> · " + esc(o.ServiceName) + "\n")
-	b.WriteString(a.statusLine(o) + "\n")
+	b.WriteString("🚘 <b>" + esc(o.CarPlate) + "</b> · " + esc(o.ServiceName.Get(l)) + "\n")
+	b.WriteString(a.statusLine(l, o) + "\n")
 	if forAdmin {
-		who := "walk-in, not linked"
+		who := T(l, "unlinked")
 		if o.ClientName != nil {
 			who = esc(*o.ClientName)
 		}

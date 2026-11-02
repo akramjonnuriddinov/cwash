@@ -64,16 +64,28 @@ func (a *App) Run(ctx context.Context) {
 	a.b.Start(ctx) // long polling, blocks until ctx is done
 }
 
+// setCommands registers the "/" menu per app language; Uzbek is the default
+// for every other language.
 func (a *App) setCommands(ctx context.Context) {
-	_, err := a.b.SetMyCommands(ctx, &bot.SetMyCommandsParams{Commands: []models.BotCommand{
-		{Command: "start", Description: "Main menu"},
-		{Command: "orders", Description: "My cars & bookings"},
-		{Command: "book", Description: "Book a wash"},
-		{Command: "cancel", Description: "Cancel current action"},
-		{Command: "myid", Description: "Show my Telegram ID"},
-	}})
-	if err != nil {
-		log.Printf("setMyCommands: %v", err)
+	for _, code := range []string{"", langUz, langRu, langEn} {
+		l := code
+		if l == "" {
+			l = defaultLang
+		}
+		_, err := a.b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+			LanguageCode: code,
+			Commands: []models.BotCommand{
+				{Command: "start", Description: T(l, "cmd_start")},
+				{Command: "orders", Description: T(l, "cmd_orders")},
+				{Command: "book", Description: T(l, "cmd_book")},
+				{Command: "lang", Description: T(l, "cmd_lang")},
+				{Command: "cancel", Description: T(l, "cmd_cancel")},
+				{Command: "myid", Description: T(l, "cmd_myid")},
+			},
+		})
+		if err != nil {
+			log.Printf("setMyCommands(%q): %v", code, err)
+		}
 	}
 }
 
@@ -95,7 +107,23 @@ func (a *App) isAdmin(tgID int64) bool { return a.cfg.AdminIDs[tgID] }
 
 func (a *App) user(ctx context.Context, from *models.User) (*store.User, error) {
 	name := strings.TrimSpace(from.FirstName + " " + from.LastName)
-	return a.st.UpsertUser(ctx, from.ID, name)
+	return a.st.UpsertUser(ctx, from.ID, name, resolveLang(from.LanguageCode))
+}
+
+// langOf returns the stored language of any Telegram user (for messages we
+// send on our own initiative, e.g. notifications to admins).
+func (a *App) langOf(ctx context.Context, tgID int64) string {
+	if l := a.st.LangByTelegramID(ctx, tgID); isLang(l) {
+		return l
+	}
+	return defaultLang
+}
+
+func clientLang(o *store.Order) string {
+	if o.ClientLang != nil && isLang(*o.ClientLang) {
+		return *o.ClientLang
+	}
+	return defaultLang
 }
 
 // ---------- state ----------
@@ -124,9 +152,10 @@ func (a *App) onMessage(ctx context.Context, m *models.Message) {
 	chatID := m.Chat.ID
 	u, err := a.user(ctx, m.From)
 	if err != nil {
-		a.fail(ctx, chatID, err)
+		a.fail(ctx, chatID, defaultLang, err)
 		return
 	}
+	l := u.Lang
 	admin := a.isAdmin(m.From.ID)
 
 	if m.Contact != nil {
@@ -136,38 +165,40 @@ func (a *App) onMessage(ctx context.Context, m *models.Message) {
 
 	text := strings.TrimSpace(m.Text)
 	cmd, arg, _ := strings.Cut(text, " ")
-	if text == btnCancel { // menu buttons contain spaces, so match the full text
-		cmd = btnCancel
-	}
-	switch cmd {
-	case "/start":
+	btn := buttonKey(text) // menu buttons contain spaces, so match the full text
+
+	switch {
+	case cmd == "/start":
 		a.clearState(m.From.ID)
 		a.onStart(ctx, chatID, u, strings.TrimSpace(arg), admin)
 		return
-	case "/cancel", btnCancel:
+	case cmd == "/cancel" || btn == "btn_cancel":
 		a.clearState(m.From.ID)
-		a.send(ctx, chatID, "OK, cancelled.", mainMenu(admin))
+		a.send(ctx, chatID, T(l, "cancelled"), a.mainMenu(l, admin))
 		return
-	case "/myid":
-		a.send(ctx, chatID, "Your Telegram ID: <code>"+itoa(m.From.ID)+"</code>", nil)
+	case cmd == "/myid":
+		a.send(ctx, chatID, T(l, "myid", m.From.ID), nil)
+		return
+	case cmd == "/lang" || btn == "btn_lang":
+		a.clearState(m.From.ID)
+		a.showLangPicker(ctx, chatID, l)
 		return
 	}
 
 	// Tapping a menu button mid-dialog abandons the dialog instead of being
 	// treated as input (e.g. "📋 Today" is not a plate number).
-	switch text {
-	case btnBook, btnMyOrders, btnContacts, btnToday, btnUpcoming, btnWalkin:
+	if btn != "" {
 		a.clearState(m.From.ID)
 	}
 
 	if s := a.getState(m.From.ID); s != nil {
 		switch s.step {
 		case stepBookPlate:
-			a.onBookingPlate(ctx, chatID, m.From.ID, text)
+			a.onBookingPlate(ctx, chatID, u, text)
 			return
 		case stepWalkinPlate, stepWalkinPhone:
 			if admin {
-				a.onWalkinText(ctx, chatID, m.From.ID, s, text)
+				a.onWalkinText(ctx, chatID, u, s, text)
 				return
 			}
 		}
@@ -175,49 +206,70 @@ func (a *App) onMessage(ctx context.Context, m *models.Message) {
 		a.clearState(m.From.ID)
 	}
 
-	switch text {
-	case btnBook, "/book":
+	switch {
+	case btn == "btn_book" || cmd == "/book":
 		a.startBooking(ctx, chatID, u)
-	case btnMyOrders, "/orders":
+	case btn == "btn_orders" || cmd == "/orders":
 		a.showMyOrders(ctx, chatID, u)
-	case btnContacts:
-		a.showContacts(ctx, chatID, admin)
-	case btnToday:
-		if admin {
-			a.adminToday(ctx, chatID)
-			return
-		}
-		a.send(ctx, chatID, "Choose an option from the menu 👇", mainMenu(admin))
-	case btnUpcoming:
-		if admin {
-			a.adminUpcoming(ctx, chatID)
-			return
-		}
-		a.send(ctx, chatID, "Choose an option from the menu 👇", mainMenu(admin))
-	case btnWalkin:
-		if admin {
-			a.adminWalkinStart(ctx, chatID, m.From.ID)
-			return
-		}
-		a.send(ctx, chatID, "Choose an option from the menu 👇", mainMenu(admin))
+	case btn == "btn_contacts":
+		a.showContacts(ctx, chatID, l, admin)
+	case btn == "btn_today" && admin:
+		a.adminToday(ctx, chatID, l)
+	case btn == "btn_upcoming" && admin:
+		a.adminUpcoming(ctx, chatID, l)
+	case btn == "btn_walkin" && admin:
+		a.adminWalkinStart(ctx, chatID, u)
 	default:
-		a.send(ctx, chatID, "Choose an option from the menu 👇", mainMenu(admin))
+		a.send(ctx, chatID, T(l, "choose_menu"), a.mainMenu(l, admin))
 	}
 }
 
 func (a *App) onCallback(ctx context.Context, cq *models.CallbackQuery) {
-	data := cq.Data
-	kind, rest, _ := strings.Cut(data, ":")
+	u, err := a.user(ctx, &cq.From)
+	if err != nil {
+		a.answer(ctx, cq, "", false)
+		a.fail(ctx, cq.From.ID, defaultLang, err)
+		return
+	}
+	kind, rest, _ := strings.Cut(cq.Data, ":")
 	switch kind {
+	case "lang":
+		a.onLangChosen(ctx, cq, u, rest)
 	case "a", "ws", "wskip":
 		if !a.isAdmin(cq.From.ID) {
-			a.answer(ctx, cq, "Admins only", true)
+			a.answer(ctx, cq, T(u.Lang, "admins_only"), true)
 			return
 		}
-		a.onAdminCallback(ctx, cq, kind, rest)
+		a.onAdminCallback(ctx, cq, u, kind, rest)
 	default:
-		a.onClientCallback(ctx, cq, kind, rest)
+		a.onClientCallback(ctx, cq, u, kind, rest)
 	}
+}
+
+// ---------- language ----------
+
+func (a *App) showLangPicker(ctx context.Context, chatID int64, l string) {
+	var row []models.InlineKeyboardButton
+	for _, code := range langs {
+		row = append(row, ib(langNames[code], "lang:"+code))
+	}
+	a.send(ctx, chatID, T(l, "choose_lang"), inline(row))
+}
+
+func (a *App) onLangChosen(ctx context.Context, cq *models.CallbackQuery, u *store.User, l string) {
+	if !isLang(l) {
+		a.answer(ctx, cq, "", false)
+		return
+	}
+	if err := a.st.SetLang(ctx, u.ID, l); err != nil {
+		a.answer(ctx, cq, "", false)
+		a.fail(ctx, cq.From.ID, u.Lang, err)
+		return
+	}
+	a.answer(ctx, cq, "", false)
+	a.edit(ctx, cq, T(l, "lang_set"), noKeyboard())
+	// a new message is needed to replace the reply keyboard with translated buttons
+	a.send(ctx, cq.From.ID, T(l, "choose_menu"), a.mainMenu(l, a.isAdmin(cq.From.ID)))
 }
 
 // ---------- reminders ----------
@@ -243,9 +295,9 @@ func (a *App) sendReminders(ctx context.Context) {
 	}
 	for _, o := range due {
 		if o.ClientTelegramID != nil {
+			l := clientLang(o)
 			mins := int(time.Until(o.ScheduledAt).Round(time.Minute).Minutes())
-			text := "⏰ <b>Reminder</b>\nYour wash starts at <b>" + a.fmtTime(o.ScheduledAt) + "</b> (in ~" + itoa(int64(mins)) + " min).\n" +
-				"🚘 " + esc(o.CarPlate) + " · " + esc(o.ServiceName)
+			text := T(l, "reminder", a.fmtTime(o.ScheduledAt), mins, esc(o.CarPlate), esc(o.ServiceName.Get(l)))
 			if a.cfg.Address != "" {
 				text += "\n📍 " + esc(a.cfg.Address)
 			}

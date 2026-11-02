@@ -9,6 +9,13 @@ go test ./...
 ```
 Only ONE instance may poll a token at a time (Telegram returns "Conflict" otherwise).
 
+## Languages
+Uzbek, Russian, English. A user's language follows their Telegram app language
+(anything other than uz/ru/en → Uzbek) until they pick one with 🌐 / `/lang`.
+All texts live in `internal/tgbot/i18n.go`; `go test` checks every key has all 3
+translations with matching placeholders. Service names: `services.name` (en),
+`name_uz`, `name_ru`.
+
 ## Order lifecycle
 `booked → waiting (arrived) → washing (ETA = now + service duration, "+10 min" extends) → ready → done`
 `booked/waiting → cancelled`. Every change is pushed to the client in Telegram.

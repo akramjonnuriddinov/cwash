@@ -41,11 +41,25 @@ type User struct {
 	TelegramID int64
 	Name       string
 	Phone      string
+	Lang       string
+}
+
+// Names holds a translatable name; empty translations fall back to English.
+type Names struct{ En, Uz, Ru string }
+
+func (n Names) Get(lang string) string {
+	switch {
+	case lang == "uz" && n.Uz != "":
+		return n.Uz
+	case lang == "ru" && n.Ru != "":
+		return n.Ru
+	}
+	return n.En
 }
 
 type Service struct {
 	ID          int
-	Name        string
+	Name        Names
 	DurationMin int
 	Price       int
 }
@@ -59,7 +73,7 @@ type Order struct {
 	Phone       string
 	CarPlate    string
 	ServiceID   int
-	ServiceName string
+	ServiceName Names
 	DurationMin int
 	Status      string
 	Source      string
@@ -69,6 +83,7 @@ type Order struct {
 
 	ClientTelegramID *int64
 	ClientName       *string
+	ClientLang       *string
 }
 
 type querier interface {
@@ -135,14 +150,30 @@ func (s *Store) migrate(ctx context.Context) error {
 
 // ---------- users ----------
 
-func (s *Store) UpsertUser(ctx context.Context, tgID int64, name string) (*User, error) {
+// UpsertUser stores the user; appLang (from the Telegram app) becomes the
+// user's language unless they picked one manually.
+func (s *Store) UpsertUser(ctx context.Context, tgID int64, name, appLang string) (*User, error) {
 	u := &User{}
 	err := s.db.QueryRow(ctx, `
-		INSERT INTO users (telegram_id, name) VALUES ($1, $2)
-		ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name
-		RETURNING id, telegram_id, name, phone`, tgID, name).
-		Scan(&u.ID, &u.TelegramID, &u.Name, &u.Phone)
+		INSERT INTO users (telegram_id, name, lang) VALUES ($1, $2, $3)
+		ON CONFLICT (telegram_id) DO UPDATE SET
+			name = EXCLUDED.name,
+			lang = CASE WHEN users.lang_manual THEN users.lang ELSE EXCLUDED.lang END
+		RETURNING id, telegram_id, name, phone, lang`, tgID, name, appLang).
+		Scan(&u.ID, &u.TelegramID, &u.Name, &u.Phone, &u.Lang)
 	return u, err
+}
+
+func (s *Store) SetLang(ctx context.Context, userID int64, lang string) error {
+	_, err := s.db.Exec(ctx, `UPDATE users SET lang=$2, lang_manual=true WHERE id=$1`, userID, lang)
+	return err
+}
+
+// LangByTelegramID returns "" if the user never opened the bot.
+func (s *Store) LangByTelegramID(ctx context.Context, tgID int64) string {
+	var lang string
+	_ = s.db.QueryRow(ctx, `SELECT lang FROM users WHERE telegram_id=$1`, tgID).Scan(&lang)
+	return lang
 }
 
 func (s *Store) SetPhone(ctx context.Context, userID int64, phone string) error {
@@ -154,10 +185,10 @@ func (s *Store) SetPhone(ctx context.Context, userID int64, phone string) error 
 func (s *Store) FindUserByPhone(ctx context.Context, phone string) (*User, error) {
 	u := &User{}
 	err := s.db.QueryRow(ctx, `
-		SELECT id, telegram_id, name, phone FROM users
+		SELECT id, telegram_id, name, phone, lang FROM users
 		WHERE phone <> '' AND right(phone, 9) = right($1, 9)
 		ORDER BY id DESC LIMIT 1`, phone).
-		Scan(&u.ID, &u.TelegramID, &u.Name, &u.Phone)
+		Scan(&u.ID, &u.TelegramID, &u.Name, &u.Phone, &u.Lang)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -167,21 +198,21 @@ func (s *Store) FindUserByPhone(ctx context.Context, phone string) (*User, error
 // ---------- services ----------
 
 func (s *Store) Services(ctx context.Context) ([]Service, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, name, duration_min, price FROM services WHERE active ORDER BY sort, id`)
+	rows, err := s.db.Query(ctx, `SELECT id, name, name_uz, name_ru, duration_min, price FROM services WHERE active ORDER BY sort, id`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Service, error) {
 		var sv Service
-		err := r.Scan(&sv.ID, &sv.Name, &sv.DurationMin, &sv.Price)
+		err := r.Scan(&sv.ID, &sv.Name.En, &sv.Name.Uz, &sv.Name.Ru, &sv.DurationMin, &sv.Price)
 		return sv, err
 	})
 }
 
 func (s *Store) Service(ctx context.Context, id int) (*Service, error) {
 	sv := &Service{}
-	err := s.db.QueryRow(ctx, `SELECT id, name, duration_min, price FROM services WHERE id=$1 AND active`, id).
-		Scan(&sv.ID, &sv.Name, &sv.DurationMin, &sv.Price)
+	err := s.db.QueryRow(ctx, `SELECT id, name, name_uz, name_ru, duration_min, price FROM services WHERE id=$1 AND active`, id).
+		Scan(&sv.ID, &sv.Name.En, &sv.Name.Uz, &sv.Name.Ru, &sv.DurationMin, &sv.Price)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -191,16 +222,17 @@ func (s *Store) Service(ctx context.Context, id int) (*Service, error) {
 // ---------- orders ----------
 
 const orderSelect = `
-SELECT o.id, o.code, o.user_id, o.phone, o.car_plate, o.service_id, s.name, s.duration_min,
-       o.status, o.source, o.scheduled_at, o.eta_at, o.created_at, u.telegram_id, u.name
+SELECT o.id, o.code, o.user_id, o.phone, o.car_plate, o.service_id, s.name, s.name_uz, s.name_ru, s.duration_min,
+       o.status, o.source, o.scheduled_at, o.eta_at, o.created_at, u.telegram_id, u.name, u.lang
 FROM orders o
 JOIN services s ON s.id = o.service_id
 LEFT JOIN users u ON u.id = o.user_id `
 
 func scanOrder(r pgx.Row) (*Order, error) {
 	o := &Order{}
-	err := r.Scan(&o.ID, &o.Code, &o.UserID, &o.Phone, &o.CarPlate, &o.ServiceID, &o.ServiceName, &o.DurationMin,
-		&o.Status, &o.Source, &o.ScheduledAt, &o.EtaAt, &o.CreatedAt, &o.ClientTelegramID, &o.ClientName)
+	err := r.Scan(&o.ID, &o.Code, &o.UserID, &o.Phone, &o.CarPlate, &o.ServiceID,
+		&o.ServiceName.En, &o.ServiceName.Uz, &o.ServiceName.Ru, &o.DurationMin,
+		&o.Status, &o.Source, &o.ScheduledAt, &o.EtaAt, &o.CreatedAt, &o.ClientTelegramID, &o.ClientName, &o.ClientLang)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
