@@ -3,7 +3,12 @@ package tgbot
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
 	"log"
+	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -44,7 +49,9 @@ type App struct {
 
 func New(ctx context.Context, cfg *config.Config, st *store.Store) (*App, error) {
 	a := &App{st: st, cfg: cfg, states: map[int64]*state{}}
-	b, err := bot.New(cfg.BotToken, bot.WithDefaultHandler(a.handle))
+	b, err := bot.New(cfg.BotToken,
+		bot.WithDefaultHandler(a.handle),
+		bot.WithWebhookSecretToken(webhookSecret(cfg.BotToken)))
 	if err != nil {
 		return nil, err
 	}
@@ -58,10 +65,63 @@ func New(ctx context.Context, cfg *config.Config, st *store.Store) (*App, error)
 
 func (a *App) Username() string { return a.username }
 
-func (a *App) Run(ctx context.Context) {
+const webhookPath = "/telegram/webhook"
+
+// webhookSecret is derived from the token so no extra env var is needed;
+// Telegram sends it back in a header, proving the request came from Telegram.
+func webhookSecret(token string) string {
+	sum := sha256.Sum256([]byte("cwash-webhook:" + token))
+	return hex.EncodeToString(sum[:])[:48]
+}
+
+// secretGuard rejects requests that don't carry Telegram's secret header.
+func secretGuard(secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// Run blocks until ctx is done. With WEBHOOK_URL set, Telegram pushes updates
+// to mux (which also wakes a hibernated app); otherwise it long-polls.
+func (a *App) Run(ctx context.Context, mux *http.ServeMux) error {
 	a.setCommands(ctx)
 	go a.reminderLoop(ctx)
-	a.b.Start(ctx) // long polling, blocks until ctx is done
+
+	if a.cfg.WebhookURL == "" {
+		info, err := a.b.GetWebhookInfo(ctx)
+		if err != nil {
+			return err
+		}
+		if info.URL != "" {
+			// Polling would fail anyway; deleting the webhook here would silently
+			// break production if a developer runs locally with the prod token.
+			return fmt.Errorf("a webhook is active for this bot (%s): this token is used in webhook mode elsewhere. "+
+				"Use a separate bot token for local development, or set WEBHOOK_URL", info.URL)
+		}
+		log.Printf("mode: long polling")
+		a.b.Start(ctx)
+		return nil
+	}
+
+	secret := webhookSecret(a.cfg.BotToken)
+	handler := a.b.WebhookHandler()
+	mux.HandleFunc("POST "+webhookPath, secretGuard(secret, handler))
+	url := a.cfg.WebhookURL + webhookPath
+	if _, err := a.b.SetWebhook(ctx, &bot.SetWebhookParams{
+		URL:            url,
+		SecretToken:    secret,
+		AllowedUpdates: []string{"message", "callback_query"},
+	}); err != nil {
+		return fmt.Errorf("setWebhook: %w", err)
+	}
+	log.Printf("mode: webhook %s", url)
+	a.b.StartWebhook(ctx)
+	return nil
 }
 
 // setCommands registers the "/" menu per app language; Uzbek is the default

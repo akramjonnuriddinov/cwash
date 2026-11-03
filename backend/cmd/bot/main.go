@@ -26,7 +26,8 @@ func main() {
 
 	// Hosting platforms (Laravel Cloud, Render, Fly…) health-check an HTTP port.
 	// Start it first so the check passes while we connect to DB/Telegram.
-	srv := startHealthServer()
+	mux := http.NewServeMux()
+	srv := startHTTPServer(mux)
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -48,16 +49,19 @@ func main() {
 	}
 	log.Printf("CWash bot @%s started (boxes=%d, hours %d-%d, tz=%s)",
 		app.Username(), cfg.Boxes, cfg.OpenHour, cfg.CloseHour, cfg.Location)
-	app.Run(ctx)
+	if err := app.Run(ctx, mux); err != nil {
+		log.Fatalf("telegram: %v", err)
+	}
 	log.Printf("stopped")
 }
 
-func startHealthServer() *http.Server {
+// startHTTPServer serves the health check on "/" (and, in webhook mode, the
+// Telegram webhook that the bot mounts on the same mux later).
+func startHTTPServer(mux *http.ServeMux) *http.Server {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok"))
@@ -65,9 +69,9 @@ func startHealthServer() *http.Server {
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("health server: %v", err)
+			log.Fatalf("http server: %v", err)
 		}
 	}()
-	log.Printf("health server listening on :%s", port)
+	log.Printf("http server listening on :%s", port)
 	return srv
 }

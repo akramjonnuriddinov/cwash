@@ -7,7 +7,16 @@ docker compose up -d          # Postgres on localhost:5434 (compose project "cwa
 go run ./cmd/bot              # migrations run automatically on start
 go test ./...
 ```
-Only ONE instance may poll a token at a time (Telegram returns "Conflict" otherwise).
+Locally the bot long-polls. Only ONE process may poll a token at a time ("Conflict" otherwise).
+
+## Production (webhook mode)
+Set `WEBHOOK_URL=https://<your-app>` → on start the bot registers
+`<WEBHOOK_URL>/telegram/webhook` with Telegram (secret header derived from the token).
+Telegram's request wakes a hibernated app, and several instances are fine.
+While a webhook is set, polling with the same token refuses to start: use a separate
+bot from @BotFather for local development.
+Note: the 1-hour booking reminder runs inside the app, so it only fires while the app
+is awake (disable hibernation, or ping `/` every few minutes, once you have real clients).
 
 ## Languages
 Uzbek, Russian, English. A user's language follows their Telegram app language

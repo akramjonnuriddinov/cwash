@@ -26,6 +26,11 @@ type Config struct {
 	Currency string
 	Address  string
 	Phone    string
+
+	// WebhookURL is the app's public base URL (e.g. https://x.laravel.cloud).
+	// Set → Telegram pushes updates to <WebhookURL>/telegram/webhook.
+	// Empty → long polling (local development).
+	WebhookURL string
 }
 
 func Load() (*Config, error) {
@@ -38,9 +43,13 @@ func Load() (*Config, error) {
 		Currency:    env("CURRENCY", "UZS"),
 		Address:     env("WASH_ADDRESS", ""),
 		Phone:       env("WASH_PHONE", ""),
+		WebhookURL:  strings.TrimRight(env("WEBHOOK_URL", ""), "/"),
 	}
 	if c.BotToken == "" {
 		return nil, errors.New("BOT_TOKEN is required")
+	}
+	if c.WebhookURL != "" && !strings.HasPrefix(c.WebhookURL, "https://") {
+		return nil, errors.New("WEBHOOK_URL must start with https://")
 	}
 
 	var err error
